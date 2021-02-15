@@ -43,6 +43,21 @@ use psp2_sys::kernel::sysmem::SceKernelMemoryAccessType::SCE_KERNEL_MEMORY_ACCES
 use psp2_sys::types::SceUID;
 use psp2_sys::void;
 
+/// A Rust interface to the PS Vita kernel allocator.
+///
+/// Uses the function [`sceKernelAllocMemBlock`] to allocate blocks of memory.
+/// This allocator will only create blocks of `4kB`-aligned memory. It won't perform
+/// the alignement itself, so you have to make sure the `size` requested [`Layout`]
+/// fits this constraint !
+///
+/// It is not thread safe, so you'll have to rely on an external synchronisation
+/// primitive, for instance by wrapping the allocator in a [`Mutex`]. As such, this
+/// allocator cannot be used directly as a global allocator.
+///
+/// [`sceKernelAllocMemBlock`]: https://docs.vitasdk.org/group__SceSysmemUser.html
+/// [`Allocator`]: https://doc.rust-lang.org/nightly/core/alloc/trait.Allocator.html
+/// [`Layout`]: https://doc.rust-lang.org/nightly/core/alloc/struct.Layout.html
+/// [`Mutex`]: struct.Mutex.html
 pub struct VitallocatorImpl {
     block_count: usize,
 }
@@ -80,7 +95,6 @@ impl VitallocatorImpl {
         } else {
             layout.size()
         };
-        // let size = (layout.size() / 4096) * 4096;
         let uid: SceUID = unsafe {
             sceKernelAllocMemBlock(
                 (&name).as_ptr(),
@@ -90,7 +104,6 @@ impl VitallocatorImpl {
             )
         };
         if uid < 0 {
-            panic!("DBG_A, uid: {}", uid);
             return Err(AllocError);
         }
 
@@ -104,7 +117,6 @@ impl VitallocatorImpl {
         unsafe {
             if sceKernelGetMemBlockBase(uid, &mut basep as *mut *mut void) < 0 {
                 sceKernelFreeMemBlock(uid); // avoid memory leak if the block cannot be used
-                panic!("DBG_B, uid: {}", uid);
                 return Err(AllocError);
             }
         }
@@ -116,34 +128,19 @@ impl VitallocatorImpl {
     }
 
     unsafe fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) {
-        // No deallocate, YOLO
         // Get the size of the pointer memory block
-        // let mut info: SceKernelMemBlockInfo = ::core::mem::uninitialized();
-        // sceKernelGetMemBlockInfoByAddr(ptr.as_ptr() as *mut void, (&mut info) as *mut _);
+        let mut info = ::core::mem::MaybeUninit::<SceKernelMemBlockInfo>::uninit();
+        sceKernelGetMemBlockInfoByAddr(ptr.as_ptr() as *mut void, (info.as_mut_ptr()));
+        let info = info.assume_init();
 
-        // // Find the SceUID
-        // let uid = sceKernelFindMemBlockByAddr(ptr.as_ptr() as *mut void, info.size);
+        // Find the SceUID
+        let uid = sceKernelFindMemBlockByAddr(ptr.as_ptr() as *mut void, info.size);
 
-        // // Free the memory block
-        // sceKernelFreeMemBlock(uid);
+        // Free the memory block
+        sceKernelFreeMemBlock(uid);
     }
 }
 
-/// A Rust interface to the PS Vita kernel allocator.
-///
-/// Uses the function [`sceKernelAllocMemBlock`] to allocate blocks of memory.
-/// This allocator will only create blocks of `4kB`-aligned memory. It won't perform
-/// the alignement itself, so you have to make sure the `size` requested [`Layout`]
-/// fits this constraint !
-///
-/// It is not thread safe, so you'll have to rely on an external synchronisation
-/// primitive, for instance by wrapping the allocator in a [`Mutex`]. As such, this
-/// allocator cannot be used directly as a global allocator.
-///
-/// [`sceKernelAllocMemBlock`]: https://docs.vitasdk.org/group__SceSysmemUser.html
-/// [`Allocator`]: https://doc.rust-lang.org/nightly/core/alloc/trait.Allocator.html
-/// [`Layout`]: https://doc.rust-lang.org/nightly/core/alloc/struct.Layout.html
-/// [`Mutex`]: struct.Mutex.html
 pub struct Vitallocator(Mutex<VitallocatorImpl>);
 
 impl Vitallocator {
@@ -166,31 +163,24 @@ impl Default for Vitallocator {
 
 unsafe impl Allocator for Vitallocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let mut lock = self.0.lock();
-        let r = lock.allocate(layout);
-        drop(lock);
-        r
+        self.0.lock().allocate(layout)
     }
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let mut lock = self.0.lock();
-        lock.deallocate(ptr, layout);
-        drop(lock);
+        self.0.lock().deallocate(ptr, layout)
     }
 }
 
 unsafe impl GlobalAlloc for Vitallocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut lock = self.0.lock();
-        let r = match lock.allocate(self.padded(layout, 4096)) {
-            Ok(ptr) => ptr.as_ptr() as *mut u8,
-            Err(_) => ::core::ptr::null_mut::<u8>(),
-        };
-        drop(lock);
-        r
+        self.0
+            .lock()
+            .allocate(self.padded(layout, 4096))
+            .map(|ptr| ptr.as_ptr() as *mut u8)
+            .unwrap_or(::core::ptr::null_mut::<u8>())
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let mut lock = self.0.lock();
-        lock.deallocate(NonNull::new_unchecked(ptr), layout);
-        drop(lock);
+        self.0
+            .lock()
+            .deallocate(NonNull::new_unchecked(ptr), layout)
     }
 }
